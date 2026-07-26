@@ -805,7 +805,7 @@ export class StreamableMCPServer {
       // Semantic Search Tools
       {
         name: 'semantic_search',
-        description: 'AI-powered semantic search using embeddings. Finds conceptually related content even without exact keyword matches. Combine with keyword search (search_library, search_fulltext) for comprehensive results.',
+        description: 'AI-powered semantic search using embeddings across My Library and group libraries. Finds conceptually related content even without exact keyword matches. Combine with keyword search (search_library, search_fulltext) for comprehensive results. Results include libraryID.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -825,6 +825,10 @@ export class StreamableMCPServer {
               type: 'string',
               enum: ['zh', 'en', 'all'],
               description: 'Filter by language (default: all)'
+            },
+            libraryID: {
+              type: 'number',
+              description: 'Optional: restrict search to one library. Omit to search all indexed libraries (My Library + groups).'
             }
           },
           required: ['query']
@@ -832,13 +836,22 @@ export class StreamableMCPServer {
       },
       {
         name: 'find_similar',
-        description: 'Find items semantically similar to a given item using AI embeddings. Useful for expanding research from a known relevant paper and discovering thematic clusters.',
+        description: 'Find items semantically similar to a given item using AI embeddings. Defaults to all libraries; pass scope=same to stay in the source library. If itemKey exists in multiple libraries, pass libraryID to disambiguate. Results include libraryID.',
         inputSchema: {
           type: 'object',
           properties: {
             itemKey: {
               type: 'string',
               description: 'The item key to find similar items for'
+            },
+            libraryID: {
+              type: 'number',
+              description: 'Library of the source item. Required when the same itemKey exists in multiple libraries.'
+            },
+            scope: {
+              type: 'string',
+              enum: ['all', 'same'],
+              description: 'Result scope: all (default) or same library as the source item'
             },
             topK: {
               type: 'number',
@@ -1714,7 +1727,8 @@ export class StreamableMCPServer {
       const results = await semanticService.search(args.query, {
         topK: args.topK,
         minScore: args.minScore,
-        language: args.language
+        language: args.language,
+        libraryID: args.libraryID,
       });
 
       const response = {
@@ -1724,6 +1738,7 @@ export class StreamableMCPServer {
         metadata: {
           extractedAt: new Date().toISOString(),
           searchMode: 'semantic',
+          libraryID: args.libraryID ?? null,
           resultCount: results.length,
           fallbackMode: semanticService.getIndexProgress().status === 'idle'
             ? (await semanticService.getStats()).serviceStatus.fallbackMode
@@ -1745,12 +1760,16 @@ export class StreamableMCPServer {
 
       const results = await semanticService.findSimilar(args.itemKey, {
         topK: args.topK,
-        minScore: args.minScore
+        minScore: args.minScore,
+        libraryID: args.libraryID,
+        scope: args.scope === 'same' ? 'same' : 'all',
       });
 
       const response = {
         mode: 'similar',
         sourceItemKey: args.itemKey,
+        sourceLibraryID: args.libraryID ?? null,
+        scope: args.scope === 'same' ? 'same' : 'all',
         data: results,
         metadata: {
           extractedAt: new Date().toISOString(),
@@ -1862,13 +1881,23 @@ export class StreamableMCPServer {
             throw new Error('itemKeys is required for get action');
           }
 
-          const contentMap = await vectorStore.getFullContentBatch(itemKeys);
-          const results: Array<{ itemKey: string; content: string | null; contentLength: number }> = [];
+          const results: Array<{ libraryID?: number; itemKey: string; content: string | null; contentLength: number }> = [];
 
           for (const key of itemKeys) {
-            const content = contentMap.get(key) || null;
+            let libraryID = Zotero.Libraries.userLibraryID;
+            let itemKey = key;
+            if (typeof key === 'string' && key.includes(':')) {
+              const colon = key.indexOf(':');
+              const parsed = Number(key.slice(0, colon));
+              if (Number.isInteger(parsed)) {
+                libraryID = parsed;
+                itemKey = key.slice(colon + 1);
+              }
+            }
+            const content = await vectorStore.getFullContent(libraryID, itemKey);
             results.push({
-              itemKey: key,
+              libraryID,
+              itemKey,
               content,
               contentLength: content ? content.length : 0
             });

@@ -4,5 +4,5 @@
     "resolveJsonModule": true
   },
   "include": ["src", "typings"],
-  "exclude": ["build", "addon"]
+  "exclude": ["build", "addon", "src/**/*.test.ts"]
 }

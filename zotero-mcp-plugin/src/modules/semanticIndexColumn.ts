@@ -42,7 +42,8 @@ export async function registerSemanticIndexColumn(): Promise<void> {
 
       // Data provider - returns the status text for each item
       dataProvider: (item: Zotero.Item, dataKey: string) => {
-        return getItemIndexStatus(item.key);
+        const libraryID = (item as any).libraryID ?? Zotero.Libraries.userLibraryID;
+        return getItemIndexStatus(`${libraryID}:${item.key}`);
       },
 
       // Custom cell renderer for styling
@@ -89,10 +90,10 @@ export function unregisterSemanticIndexColumn(): void {
 }
 
 /**
- * Get the index status for a specific item
+ * Get the index status for a specific item (identity key libraryID:itemKey)
  * Uses cached data to avoid repeated database queries
  */
-function getItemIndexStatus(itemKey: string): string {
+function getItemIndexStatus(identityKey: string): string {
   // Check if cache is valid
   const now = Date.now();
   if (!indexedItemsCache || (now - cacheTimestamp) > CACHE_TTL_MS) {
@@ -103,7 +104,7 @@ function getItemIndexStatus(itemKey: string): string {
   }
 
   // Return status from cache
-  return indexedItemsCache.has(itemKey) ? '\u2713' : '-';
+  return indexedItemsCache.has(identityKey) ? '\u2713' : '-';
 }
 
 /**

@@ -10,9 +10,18 @@ export {
   getSemanticSearchService,
   type SemanticSearchOptions,
   type SemanticSearchResult,
+  type FindSimilarOptions,
   type IndexProgress,
   type SemanticServiceStats
 } from './semanticSearchService';
+
+export {
+  itemIdentityKey,
+  parseExcludeLibraryIDs,
+  isIndexableLibrary,
+  filterIndexableLibraries,
+  resolveFindSimilarSource,
+} from './libraryScope';
 
 // Embedding service
 export {

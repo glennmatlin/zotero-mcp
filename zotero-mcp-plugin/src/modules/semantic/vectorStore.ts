@@ -11,6 +11,7 @@ declare let PathUtils: any;
 declare let IOUtils: any;
 
 export interface VectorRecord {
+  libraryID: number;
   itemKey: string;
   chunkId: number;
   vector: Float32Array;
@@ -27,6 +28,7 @@ export interface QuantizedVector {
 }
 
 export interface SearchResult {
+  libraryID: number;
   itemKey: string;
   chunkId: number;
   score: number;
@@ -35,6 +37,7 @@ export interface SearchResult {
 }
 
 export interface IndexStatus {
+  libraryID: number;
   itemKey: string;
   indexedAt: number;
   chunkCount: number;
@@ -245,14 +248,50 @@ export class VectorStore {
     }
   }
 
-  private async createTables(): Promise<void> {
-    // Embeddings table
-    // Note: vector column retains NOT NULL for backward compatibility with older schemas.
-    // Float32 vectors are stored in separate vectors_f32 table. This column holds empty
-    // blob x'' after migration. New inserts also write x'' here.
+  private async tableExists(table: string): Promise<boolean> {
+    const rows = await this.db.queryAsync(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name=?`,
+      [table],
+    );
+    return !!(rows && rows.length > 0);
+  }
+
+  private async hasColumn(table: string, column: string): Promise<boolean> {
+    const rows = await this.db.queryAsync(`PRAGMA table_info(${table})`);
+    return (rows || []).some((r: any) => r.name === column);
+  }
+
+  /**
+   * Ensure multi-library schema (library_id + item_key identity).
+   * Soft-migrates older personal-only DBs by stamping userLibraryID.
+   */
+  private async ensureMultiLibrarySchema(): Promise<void> {
+    const userLibraryID: number = Zotero.Libraries.userLibraryID;
+    const embeddingsExists = await this.tableExists('embeddings');
+
+    if (!embeddingsExists) {
+      await this.createMultiLibraryTablesFresh();
+      return;
+    }
+
+    if (!(await this.hasColumn('embeddings', 'library_id'))) {
+      ztoolkit.log(
+        `[VectorStore] Migrating semantic index to multi-library (stamp library_id=${userLibraryID})...`,
+      );
+      await this.migrateTablesToMultiLibrary(userLibraryID);
+      ztoolkit.log('[VectorStore] Multi-library schema migration complete');
+      return;
+    }
+
+    // Already multi-library: keep optional columns / indexes in sync
+    await this.ensureOptionalEmbeddingColumns();
+  }
+
+  private async createMultiLibraryTablesFresh(): Promise<void> {
     await this.db.queryAsync(`
       CREATE TABLE IF NOT EXISTS embeddings (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        library_id INTEGER NOT NULL,
         item_key TEXT NOT NULL,
         chunk_id INTEGER NOT NULL,
         vector BLOB NOT NULL,
@@ -260,14 +299,16 @@ export class VectorStore {
         chunk_text TEXT,
         dimensions INTEGER NOT NULL,
         created_at INTEGER DEFAULT (strftime('%s', 'now')),
-        UNIQUE(item_key, chunk_id)
+        vector_int8 BLOB,
+        vector_scale REAL,
+        vector_norm REAL,
+        UNIQUE(library_id, item_key, chunk_id)
       )
     `);
 
-    // Index for faster lookups
     await this.db.queryAsync(`
-      CREATE INDEX IF NOT EXISTS idx_embeddings_item_key
-      ON embeddings(item_key)
+      CREATE INDEX IF NOT EXISTS idx_embeddings_item
+      ON embeddings(library_id, item_key)
     `);
 
     await this.db.queryAsync(`
@@ -275,87 +316,251 @@ export class VectorStore {
       ON embeddings(language)
     `);
 
-    // Index status table - tracks indexing state and timestamps for change detection
     await this.db.queryAsync(`
       CREATE TABLE IF NOT EXISTS index_status (
-        item_key TEXT PRIMARY KEY,
+        library_id INTEGER NOT NULL,
+        item_key TEXT NOT NULL,
         indexed_at INTEGER NOT NULL,
         version INTEGER DEFAULT 1,
         chunk_count INTEGER NOT NULL,
         content_hash TEXT NOT NULL,
         item_modified TEXT,
-        attachment_modified TEXT
+        attachment_modified TEXT,
+        PRIMARY KEY (library_id, item_key)
       )
     `);
 
-    // Migrate existing tables - add new columns if they don't exist
-    try {
-      await this.db.queryAsync(`ALTER TABLE index_status ADD COLUMN item_modified TEXT`);
-    } catch (e) {
-      // Column already exists, ignore
-    }
-    try {
-      await this.db.queryAsync(`ALTER TABLE index_status ADD COLUMN attachment_modified TEXT`);
-    } catch (e) {
-      // Column already exists, ignore
-    }
-
-    // Migration: Add Int8 quantized vector columns for optimized search
-    // vector_int8: Int8 quantized vector data (1 byte per dimension vs 4 bytes)
-    // vector_scale: Scale factor for dequantization
-    // vector_norm: Pre-computed L2 norm for fast cosine similarity
-    try {
-      await this.db.queryAsync(`ALTER TABLE embeddings ADD COLUMN vector_int8 BLOB`);
-      ztoolkit.log('[VectorStore] Added vector_int8 column');
-    } catch (e) {
-      // Column already exists, ignore
-    }
-    try {
-      await this.db.queryAsync(`ALTER TABLE embeddings ADD COLUMN vector_scale REAL`);
-      ztoolkit.log('[VectorStore] Added vector_scale column');
-    } catch (e) {
-      // Column already exists, ignore
-    }
-    try {
-      await this.db.queryAsync(`ALTER TABLE embeddings ADD COLUMN vector_norm REAL`);
-      ztoolkit.log('[VectorStore] Added vector_norm column');
-    } catch (e) {
-      // Column already exists, ignore
-    }
-
-    // Content cache table - stores extracted PDF content to avoid re-extraction
     await this.db.queryAsync(`
       CREATE TABLE IF NOT EXISTS content_cache (
-        item_key TEXT PRIMARY KEY,
+        library_id INTEGER NOT NULL,
+        item_key TEXT NOT NULL,
         full_content TEXT NOT NULL,
         content_hash TEXT NOT NULL,
-        cached_at INTEGER DEFAULT (strftime('%s', 'now'))
+        cached_at INTEGER DEFAULT (strftime('%s', 'now')),
+        PRIMARY KEY (library_id, item_key)
       )
     `);
 
-    // Float32 backup table - stores float32 vectors separately for space efficiency
-    // With 3072-dim vectors: int8(4KB) + float32(12KB) = 16.8KB per row in one table
-    // causes each row to occupy an entire 32KB SQLite page (47% waste).
-    // Splitting allows: int8 rows (~4.5KB, 7/page) + float32 rows (~12KB, 2/page)
     await this.db.queryAsync(`
       CREATE TABLE IF NOT EXISTS vectors_f32 (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        library_id INTEGER NOT NULL,
         item_key TEXT NOT NULL,
         chunk_id INTEGER NOT NULL,
         vector BLOB NOT NULL,
-        UNIQUE(item_key, chunk_id)
+        UNIQUE(library_id, item_key, chunk_id)
       )
     `);
 
     await this.db.queryAsync(`
-      CREATE INDEX IF NOT EXISTS idx_vectors_f32_item_key
-      ON vectors_f32(item_key)
+      CREATE INDEX IF NOT EXISTS idx_vectors_f32_item
+      ON vectors_f32(library_id, item_key)
+    `);
+  }
+
+  private async migrateTablesToMultiLibrary(userLibraryID: number): Promise<void> {
+    // --- embeddings ---
+    await this.db.queryAsync(`
+      CREATE TABLE embeddings_ml (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        library_id INTEGER NOT NULL,
+        item_key TEXT NOT NULL,
+        chunk_id INTEGER NOT NULL,
+        vector BLOB NOT NULL,
+        language TEXT NOT NULL CHECK(language IN ('zh', 'en')),
+        chunk_text TEXT,
+        dimensions INTEGER NOT NULL,
+        created_at INTEGER DEFAULT (strftime('%s', 'now')),
+        vector_int8 BLOB,
+        vector_scale REAL,
+        vector_norm REAL,
+        UNIQUE(library_id, item_key, chunk_id)
+      )
     `);
 
-    // Migration: move float32 vectors from embeddings to vectors_f32
+    const embCols = await this.db.queryAsync(`PRAGMA table_info(embeddings)`);
+    const embNames = new Set((embCols || []).map((c: any) => c.name));
+    const hasInt8 = embNames.has('vector_int8');
+
+    if (hasInt8) {
+      await this.db.queryAsync(
+        `INSERT INTO embeddings_ml (
+          library_id, item_key, chunk_id, vector, language, chunk_text, dimensions,
+          created_at, vector_int8, vector_scale, vector_norm
+        )
+        SELECT ?, item_key, chunk_id, vector, language, chunk_text, dimensions,
+          created_at, vector_int8, vector_scale, vector_norm
+        FROM embeddings`,
+        [userLibraryID],
+      );
+    } else {
+      await this.db.queryAsync(
+        `INSERT INTO embeddings_ml (
+          library_id, item_key, chunk_id, vector, language, chunk_text, dimensions, created_at
+        )
+        SELECT ?, item_key, chunk_id, vector, language, chunk_text, dimensions, created_at
+        FROM embeddings`,
+        [userLibraryID],
+      );
+    }
+    await this.db.queryAsync(`DROP TABLE embeddings`);
+    await this.db.queryAsync(`ALTER TABLE embeddings_ml RENAME TO embeddings`);
+    await this.db.queryAsync(
+      `CREATE INDEX IF NOT EXISTS idx_embeddings_item ON embeddings(library_id, item_key)`,
+    );
+    await this.db.queryAsync(
+      `CREATE INDEX IF NOT EXISTS idx_embeddings_language ON embeddings(language)`,
+    );
+
+    // --- index_status ---
+    if (await this.tableExists('index_status')) {
+      await this.db.queryAsync(`
+        CREATE TABLE index_status_ml (
+          library_id INTEGER NOT NULL,
+          item_key TEXT NOT NULL,
+          indexed_at INTEGER NOT NULL,
+          version INTEGER DEFAULT 1,
+          chunk_count INTEGER NOT NULL,
+          content_hash TEXT NOT NULL,
+          item_modified TEXT,
+          attachment_modified TEXT,
+          PRIMARY KEY (library_id, item_key)
+        )
+      `);
+      const isCols = await this.db.queryAsync(`PRAGMA table_info(index_status)`);
+      const isNames = new Set((isCols || []).map((c: any) => c.name));
+      const hasItemMod = isNames.has('item_modified');
+      if (hasItemMod) {
+        await this.db.queryAsync(
+          `INSERT OR IGNORE INTO index_status_ml (
+            library_id, item_key, indexed_at, version, chunk_count, content_hash,
+            item_modified, attachment_modified
+          )
+          SELECT ?, item_key, indexed_at, version, chunk_count, content_hash,
+            item_modified, attachment_modified
+          FROM index_status`,
+          [userLibraryID],
+        );
+      } else {
+        await this.db.queryAsync(
+          `INSERT OR IGNORE INTO index_status_ml (
+            library_id, item_key, indexed_at, version, chunk_count, content_hash
+          )
+          SELECT ?, item_key, indexed_at, version, chunk_count, content_hash
+          FROM index_status`,
+          [userLibraryID],
+        );
+      }
+      await this.db.queryAsync(`DROP TABLE index_status`);
+      await this.db.queryAsync(`ALTER TABLE index_status_ml RENAME TO index_status`);
+    } else {
+      await this.db.queryAsync(`
+        CREATE TABLE index_status (
+          library_id INTEGER NOT NULL,
+          item_key TEXT NOT NULL,
+          indexed_at INTEGER NOT NULL,
+          version INTEGER DEFAULT 1,
+          chunk_count INTEGER NOT NULL,
+          content_hash TEXT NOT NULL,
+          item_modified TEXT,
+          attachment_modified TEXT,
+          PRIMARY KEY (library_id, item_key)
+        )
+      `);
+    }
+
+    // --- content_cache ---
+    if (await this.tableExists('content_cache')) {
+      await this.db.queryAsync(`
+        CREATE TABLE content_cache_ml (
+          library_id INTEGER NOT NULL,
+          item_key TEXT NOT NULL,
+          full_content TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          cached_at INTEGER DEFAULT (strftime('%s', 'now')),
+          PRIMARY KEY (library_id, item_key)
+        )
+      `);
+      await this.db.queryAsync(
+        `INSERT OR IGNORE INTO content_cache_ml (
+          library_id, item_key, full_content, content_hash, cached_at
+        )
+        SELECT ?, item_key, full_content, content_hash, cached_at FROM content_cache`,
+        [userLibraryID],
+      );
+      await this.db.queryAsync(`DROP TABLE content_cache`);
+      await this.db.queryAsync(`ALTER TABLE content_cache_ml RENAME TO content_cache`);
+    } else {
+      await this.db.queryAsync(`
+        CREATE TABLE content_cache (
+          library_id INTEGER NOT NULL,
+          item_key TEXT NOT NULL,
+          full_content TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          cached_at INTEGER DEFAULT (strftime('%s', 'now')),
+          PRIMARY KEY (library_id, item_key)
+        )
+      `);
+    }
+
+    // --- vectors_f32 ---
+    if (await this.tableExists('vectors_f32')) {
+      await this.db.queryAsync(`
+        CREATE TABLE vectors_f32_ml (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          library_id INTEGER NOT NULL,
+          item_key TEXT NOT NULL,
+          chunk_id INTEGER NOT NULL,
+          vector BLOB NOT NULL,
+          UNIQUE(library_id, item_key, chunk_id)
+        )
+      `);
+      await this.db.queryAsync(
+        `INSERT OR IGNORE INTO vectors_f32_ml (library_id, item_key, chunk_id, vector)
+         SELECT ?, item_key, chunk_id, vector FROM vectors_f32`,
+        [userLibraryID],
+      );
+      await this.db.queryAsync(`DROP TABLE vectors_f32`);
+      await this.db.queryAsync(`ALTER TABLE vectors_f32_ml RENAME TO vectors_f32`);
+      await this.db.queryAsync(
+        `CREATE INDEX IF NOT EXISTS idx_vectors_f32_item ON vectors_f32(library_id, item_key)`,
+      );
+    } else {
+      await this.db.queryAsync(`
+        CREATE TABLE vectors_f32 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          library_id INTEGER NOT NULL,
+          item_key TEXT NOT NULL,
+          chunk_id INTEGER NOT NULL,
+          vector BLOB NOT NULL,
+          UNIQUE(library_id, item_key, chunk_id)
+        )
+      `);
+      await this.db.queryAsync(
+        `CREATE INDEX IF NOT EXISTS idx_vectors_f32_item ON vectors_f32(library_id, item_key)`,
+      );
+    }
+  }
+
+  private async ensureOptionalEmbeddingColumns(): Promise<void> {
+    try {
+      await this.db.queryAsync(`ALTER TABLE embeddings ADD COLUMN vector_int8 BLOB`);
+    } catch (_) {}
+    try {
+      await this.db.queryAsync(`ALTER TABLE embeddings ADD COLUMN vector_scale REAL`);
+    } catch (_) {}
+    try {
+      await this.db.queryAsync(`ALTER TABLE embeddings ADD COLUMN vector_norm REAL`);
+    } catch (_) {}
+  }
+
+  private async createTables(): Promise<void> {
+    await this.ensureMultiLibrarySchema();
+
+    // Migration: move float32 vectors from embeddings to vectors_f32 (legacy path)
     await this.migrateFloat32ToSeparateTable();
 
-    ztoolkit.log('[VectorStore] Tables created/verified');
+    ztoolkit.log('[VectorStore] Tables created/verified (multi-library)');
   }
 
   /**
@@ -390,8 +595,8 @@ export class VectorStore {
     // Use pure SQL to migrate blobs - avoids JS blob binding issues (NS_ERROR_UNEXPECTED)
     // INSERT OR IGNORE ensures idempotency for partial re-runs
     await this.db.queryAsync(`
-      INSERT OR IGNORE INTO vectors_f32 (item_key, chunk_id, vector)
-      SELECT item_key, chunk_id, vector FROM embeddings WHERE LENGTH(vector) > 0
+      INSERT OR IGNORE INTO vectors_f32 (library_id, item_key, chunk_id, vector)
+      SELECT library_id, item_key, chunk_id, vector FROM embeddings WHERE LENGTH(vector) > 0
     `);
 
     // Clear float32 data from embeddings (x'' satisfies NOT NULL constraint)
@@ -418,7 +623,8 @@ export class VectorStore {
   async insertVector(record: VectorRecord): Promise<void> {
     await this.ensureInitialized();
 
-    ztoolkit.log(`[VectorStore] insertVector: ${record.itemKey}_${record.chunkId}, dims=${record.vector.length}, lang=${record.language}`);
+    const libraryID = record.libraryID;
+    ztoolkit.log(`[VectorStore] insertVector: ${libraryID}:${record.itemKey}_${record.chunkId}, dims=${record.vector.length}, lang=${record.language}`);
 
     const vectorBlob = this.float32ArrayToBuffer(record.vector);
 
@@ -428,7 +634,8 @@ export class VectorStore {
     const int8Base64 = this.int8ArrayToBase64(quantized.int8Data);
 
     // Write int8 + metadata to embeddings (vector column = empty blob placeholder)
-    await this.db.queryAsync(`INSERT OR REPLACE INTO embeddings (item_key, chunk_id, vector, language, chunk_text, dimensions, vector_int8, vector_scale, vector_norm) VALUES (?, ?, x'', ?, ?, ?, ?, ?, ?)`, [
+    await this.db.queryAsync(`INSERT OR REPLACE INTO embeddings (library_id, item_key, chunk_id, vector, language, chunk_text, dimensions, vector_int8, vector_scale, vector_norm) VALUES (?, ?, ?, x'', ?, ?, ?, ?, ?, ?)`, [
+      libraryID,
       record.itemKey,
       record.chunkId,
       record.language,
@@ -440,14 +647,15 @@ export class VectorStore {
     ]);
 
     // Write float32 vector to separate table
-    await this.db.queryAsync(`INSERT OR REPLACE INTO vectors_f32 (item_key, chunk_id, vector) VALUES (?, ?, ?)`, [
+    await this.db.queryAsync(`INSERT OR REPLACE INTO vectors_f32 (library_id, item_key, chunk_id, vector) VALUES (?, ?, ?, ?)`, [
+      libraryID,
       record.itemKey,
       record.chunkId,
       vectorBlob
     ]);
 
     // Update cache
-    const cacheKey = `${record.itemKey}_${record.chunkId}`;
+    const cacheKey = `${libraryID}:${record.itemKey}_${record.chunkId}`;
     this.updateCache(cacheKey, record.vector);
   }
 
@@ -462,6 +670,7 @@ export class VectorStore {
 
     await this.db.executeTransaction(async () => {
       for (const record of records) {
+        const libraryID = record.libraryID;
         const vectorBlob = this.float32ArrayToBuffer(record.vector);
 
         // Pre-compute Int8 quantized vector and norm for optimized search
@@ -470,7 +679,8 @@ export class VectorStore {
         const int8Base64 = this.int8ArrayToBase64(quantized.int8Data);
 
         // Write int8 + metadata to embeddings (vector column = empty blob placeholder)
-        await this.db.queryAsync(`INSERT OR REPLACE INTO embeddings (item_key, chunk_id, vector, language, chunk_text, dimensions, vector_int8, vector_scale, vector_norm) VALUES (?, ?, x'', ?, ?, ?, ?, ?, ?)`, [
+        await this.db.queryAsync(`INSERT OR REPLACE INTO embeddings (library_id, item_key, chunk_id, vector, language, chunk_text, dimensions, vector_int8, vector_scale, vector_norm) VALUES (?, ?, ?, x'', ?, ?, ?, ?, ?, ?)`, [
+          libraryID,
           record.itemKey,
           record.chunkId,
           record.language,
@@ -482,7 +692,8 @@ export class VectorStore {
         ]);
 
         // Write float32 vector to separate table
-        await this.db.queryAsync(`INSERT OR REPLACE INTO vectors_f32 (item_key, chunk_id, vector) VALUES (?, ?, ?)`, [
+        await this.db.queryAsync(`INSERT OR REPLACE INTO vectors_f32 (library_id, item_key, chunk_id, vector) VALUES (?, ?, ?, ?)`, [
+          libraryID,
           record.itemKey,
           record.chunkId,
           vectorBlob
@@ -511,15 +722,19 @@ export class VectorStore {
       topK?: number;
       language?: 'zh' | 'en' | 'all';
       itemKeys?: string[];
+      libraryID?: number;
+      /** When true with a source item, exclude that item from results */
+      excludeLibraryID?: number;
+      excludeItemKey?: string;
       minScore?: number;
     } = {}
   ): Promise<SearchResult[]> {
     await this.ensureInitialized();
 
-    const { topK = 10, language = 'all', itemKeys, minScore = 0 } = options;
+    const { topK = 10, language = 'all', itemKeys, libraryID, excludeLibraryID, excludeItemKey, minScore = 0 } = options;
     const startTime = Date.now();
 
-    ztoolkit.log(`[VectorStore] search() start: instanceId=${this.instanceId}, topK=${topK}, lang=${language}, minScore=${minScore}, queryDims=${queryVector.length}`);
+    ztoolkit.log(`[VectorStore] search() start: instanceId=${this.instanceId}, topK=${topK}, lang=${language}, libraryID=${libraryID ?? 'all'}, minScore=${minScore}, queryDims=${queryVector.length}`);
 
     // Build query conditions
     const conditions: string[] = ['1=1'];
@@ -530,10 +745,20 @@ export class VectorStore {
       params.push(language);
     }
 
+    if (libraryID != null && Number.isFinite(libraryID)) {
+      conditions.push('library_id = ?');
+      params.push(libraryID);
+    }
+
     if (itemKeys && itemKeys.length > 0) {
       const placeholders = itemKeys.map(() => '?').join(',');
       conditions.push(`item_key IN (${placeholders})`);
       params.push(...itemKeys);
+    }
+
+    if (excludeLibraryID != null && excludeItemKey) {
+      conditions.push('NOT (library_id = ? AND item_key = ?)');
+      params.push(excludeLibraryID, excludeItemKey);
     }
 
     // Optimized batch size: 50,000 vectors per chunk
@@ -613,8 +838,8 @@ export class VectorStore {
       // Select appropriate columns based on availability
       // Float32 vectors are in vectors_f32 table — only load when needed (fallback path)
       const selectCols = useInt8
-        ? 'item_key, chunk_id, vector_int8, vector_scale, vector_norm, language, chunk_text, dimensions'
-        : 'item_key, chunk_id, language, chunk_text, dimensions';
+        ? 'library_id, item_key, chunk_id, vector_int8, vector_scale, vector_norm, language, chunk_text, dimensions'
+        : 'library_id, item_key, chunk_id, language, chunk_text, dimensions';
 
       const rows = await this.db.queryAsync(`SELECT ${selectCols} FROM embeddings WHERE ${whereClause} LIMIT ? OFFSET ?`, batchParams);
 
@@ -642,7 +867,7 @@ export class VectorStore {
             // Verify decoded array length matches expected dimensions
             if (storedInt8.length !== queryQuantized.int8Data.length) {
               // Length mismatch - fall back to Float32 from vectors_f32 table
-              const f32Row = await this.db.queryAsync(`SELECT vector FROM vectors_f32 WHERE item_key = ? AND chunk_id = ?`, [row.item_key, row.chunk_id]);
+              const f32Row = await this.db.queryAsync(`SELECT vector FROM vectors_f32 WHERE library_id = ? AND item_key = ? AND chunk_id = ?`, [row.library_id, row.item_key, row.chunk_id]);
               if (f32Row && f32Row.length > 0) {
                 const storedVector = this.bufferToFloat32Array(f32Row[0].vector, row.dimensions);
                 score = this.cosineSimilarityWithNormalizedQuery(normalizedQuery, storedVector);
@@ -673,7 +898,7 @@ export class VectorStore {
                 // Also compute Float32 similarity for comparison (load from vectors_f32)
                 let float32Score = NaN;
                 let sampleFloat32: Float32Array = new Float32Array(0);
-                const debugF32Row = await this.db.queryAsync(`SELECT vector FROM vectors_f32 WHERE item_key = ? AND chunk_id = ?`, [row.item_key, row.chunk_id]);
+                const debugF32Row = await this.db.queryAsync(`SELECT vector FROM vectors_f32 WHERE library_id = ? AND item_key = ? AND chunk_id = ?`, [row.library_id, row.item_key, row.chunk_id]);
                 if (debugF32Row && debugF32Row.length > 0) {
                   const storedFloat32 = this.bufferToFloat32Array(debugF32Row[0].vector, row.dimensions);
                   float32Score = this.cosineSimilarityWithNormalizedQuery(normalizedQuery, storedFloat32);
@@ -694,7 +919,7 @@ export class VectorStore {
             if (queryDims !== storedDims) {
               ztoolkit.log(`[VectorStore] Dimension mismatch: query=${queryDims}, stored=${storedDims}, falling back to Float32`);
             }
-            const f32Row = await this.db.queryAsync(`SELECT vector FROM vectors_f32 WHERE item_key = ? AND chunk_id = ?`, [row.item_key, row.chunk_id]);
+            const f32Row = await this.db.queryAsync(`SELECT vector FROM vectors_f32 WHERE library_id = ? AND item_key = ? AND chunk_id = ?`, [row.library_id, row.item_key, row.chunk_id]);
             if (f32Row && f32Row.length > 0) {
               const storedVector = this.bufferToFloat32Array(f32Row[0].vector, row.dimensions);
               score = this.cosineSimilarityWithNormalizedQuery(normalizedQuery, storedVector);
@@ -717,6 +942,7 @@ export class VectorStore {
 
           if (score >= minScore) {
             const result: SearchResult = {
+              libraryID: row.library_id,
               itemKey: row.item_key,
               chunkId: row.chunk_id,
               score,
@@ -770,61 +996,86 @@ export class VectorStore {
   }
 
   /**
-   * Get all indexed item keys
+   * Get all indexed item identity keys (`libraryID:itemKey`).
    */
   async getIndexedItems(): Promise<Set<string>> {
     await this.ensureInitialized();
 
     // IMPORTANT: Single-line query to avoid Zotero queryAsync bug with multi-line SQL
-    const rows = await this.db.queryAsync(`SELECT item_key FROM index_status`);
+    const rows = await this.db.queryAsync(`SELECT library_id, item_key FROM index_status`);
 
     // Zotero's queryAsync returns undefined when no rows found
     if (!rows || rows.length === 0) {
       return new Set();
     }
 
-    return new Set(rows.map((r: any) => r.item_key));
+    return new Set(rows.map((r: any) => `${r.library_id}:${r.item_key}`));
   }
 
   /**
-   * Get item keys that were actually indexed (excludes 'failed:<type>'
-   * markers) — for UI display, unlike getIndexedItems which the build
-   * filter uses to skip both indexed and known-failed items
+   * Get successfully indexed identity keys (excludes failure markers).
    */
   async getSuccessfullyIndexedItems(): Promise<Set<string>> {
     await this.ensureInitialized();
 
     // IMPORTANT: Single-line query to avoid Zotero queryAsync bug with multi-line SQL
-    const rows = await this.db.queryAsync(`SELECT item_key FROM index_status WHERE content_hash NOT LIKE 'failed:%'`);
+    const rows = await this.db.queryAsync(`SELECT library_id, item_key FROM index_status WHERE content_hash NOT LIKE 'failed:%'`);
 
     if (!rows || rows.length === 0) {
       return new Set();
     }
 
-    return new Set(rows.map((r: any) => r.item_key));
+    return new Set(rows.map((r: any) => `${r.library_id}:${r.item_key}`));
   }
 
   /**
-   * Get item keys previously marked as failed (content_hash = 'failed:<type>')
+   * Get identity keys previously marked as failed.
    */
   async getFailedItemKeys(): Promise<string[]> {
     await this.ensureInitialized();
 
     // IMPORTANT: Single-line query to avoid Zotero queryAsync bug with multi-line SQL
-    const rows = await this.db.queryAsync(`SELECT item_key FROM index_status WHERE content_hash LIKE 'failed:%'`);
+    const rows = await this.db.queryAsync(`SELECT library_id, item_key FROM index_status WHERE content_hash LIKE 'failed:%'`);
 
-    return rows && rows.length > 0 ? rows.map((r: any) => r.item_key) : [];
+    return rows && rows.length > 0
+      ? rows.map((r: any) => `${r.library_id}:${r.item_key}`)
+      : [];
   }
 
   /**
-   * Remove failure markers so the items become indexable again
+   * List (libraryID, itemKey) pairs that have any vectors for a given itemKey
+   * (for find_similar disambiguation).
    */
-  async clearFailedMarkers(keys?: string[]): Promise<void> {
+  async listLibrariesForItemKey(itemKey: string): Promise<Array<{ libraryID: number; itemKey: string }>> {
+    await this.ensureInitialized();
+    const rows = await this.db.queryAsync(
+      `SELECT DISTINCT library_id, item_key FROM index_status WHERE item_key = ?`,
+      [itemKey],
+    );
+    if (!rows || rows.length === 0) return [];
+    return rows.map((r: any) => ({
+      libraryID: r.library_id,
+      itemKey: r.item_key,
+    }));
+  }
+
+  /**
+   * Remove failure markers so the items become indexable again.
+   * @param identityKeys optional list of `libraryID:itemKey` strings
+   */
+  async clearFailedMarkers(identityKeys?: string[]): Promise<void> {
     await this.ensureInitialized();
 
-    if (keys && keys.length > 0) {
-      for (const key of keys) {
-        await this.db.queryAsync(`DELETE FROM index_status WHERE item_key = ? AND content_hash LIKE 'failed:%'`, [key]);
+    if (identityKeys && identityKeys.length > 0) {
+      for (const idKey of identityKeys) {
+        const colon = idKey.indexOf(':');
+        if (colon <= 0) continue;
+        const libraryID = Number(idKey.slice(0, colon));
+        const itemKey = idKey.slice(colon + 1);
+        await this.db.queryAsync(
+          `DELETE FROM index_status WHERE library_id = ? AND item_key = ? AND content_hash LIKE 'failed:%'`,
+          [libraryID, itemKey],
+        );
       }
     } else {
       await this.db.queryAsync(`DELETE FROM index_status WHERE content_hash LIKE 'failed:%'`);
@@ -832,19 +1083,20 @@ export class VectorStore {
   }
 
   /**
-   * Get index status for an item
+   * Get index status for an item in a library
    */
-  async getIndexStatus(itemKey: string): Promise<IndexStatus | null> {
+  async getIndexStatus(libraryID: number, itemKey: string): Promise<IndexStatus | null> {
     await this.ensureInitialized();
 
     // IMPORTANT: Single-line query to avoid Zotero queryAsync bug with multi-line SQL
-    const rows = await this.db.queryAsync(`SELECT item_key, indexed_at, version, chunk_count, content_hash, item_modified, attachment_modified FROM index_status WHERE item_key = ?`, [itemKey]);
+    const rows = await this.db.queryAsync(`SELECT library_id, item_key, indexed_at, version, chunk_count, content_hash, item_modified, attachment_modified FROM index_status WHERE library_id = ? AND item_key = ?`, [libraryID, itemKey]);
 
     // Zotero's queryAsync returns undefined when no rows found
     if (!rows || rows.length === 0) return null;
 
     const row = rows[0];
     return {
+      libraryID: row.library_id,
       itemKey: row.item_key,
       indexedAt: row.indexed_at,
       chunkCount: row.chunk_count,
@@ -859,6 +1111,7 @@ export class VectorStore {
    * Update index status for an item (with optional timestamps)
    */
   async updateIndexStatus(
+    libraryID: number,
     itemKey: string,
     chunkCount: number,
     contentHash: string,
@@ -869,9 +1122,9 @@ export class VectorStore {
 
     await this.db.queryAsync(`
       INSERT OR REPLACE INTO index_status
-      (item_key, indexed_at, version, chunk_count, content_hash, item_modified, attachment_modified)
-      VALUES (?, strftime('%s', 'now'), 1, ?, ?, ?, ?)
-    `, [itemKey, chunkCount, contentHash, itemModified || null, attachmentModified || null]);
+      (library_id, item_key, indexed_at, version, chunk_count, content_hash, item_modified, attachment_modified)
+      VALUES (?, ?, strftime('%s', 'now'), 1, ?, ?, ?, ?)
+    `, [libraryID, itemKey, chunkCount, contentHash, itemModified || null, attachmentModified || null]);
   }
 
   /**
@@ -879,11 +1132,12 @@ export class VectorStore {
    * Returns: true if needs reindex, false if timestamps unchanged
    */
   async needsReindexByTimestamp(
+    libraryID: number,
     itemKey: string,
     itemModified: string,
     attachmentModified: string
   ): Promise<boolean> {
-    const status = await this.getIndexStatus(itemKey);
+    const status = await this.getIndexStatus(libraryID, itemKey);
 
     // No existing index, needs indexing
     if (!status) return true;
@@ -902,8 +1156,8 @@ export class VectorStore {
   /**
    * Check if item needs re-indexing by content hash
    */
-  async needsReindex(itemKey: string, contentHash: string): Promise<boolean> {
-    const status = await this.getIndexStatus(itemKey);
+  async needsReindex(libraryID: number, itemKey: string, contentHash: string): Promise<boolean> {
+    const status = await this.getIndexStatus(libraryID, itemKey);
     if (!status) return true;
     return status.contentHash !== contentHash;
   }
@@ -914,11 +1168,11 @@ export class VectorStore {
    * Get cached content for an item
    * Returns null if not cached or hash doesn't match
    */
-  async getCachedContent(itemKey: string): Promise<{ content: string; hash: string } | null> {
+  async getCachedContent(libraryID: number, itemKey: string): Promise<{ content: string; hash: string } | null> {
     await this.ensureInitialized();
 
     // IMPORTANT: Single-line query to avoid Zotero queryAsync bug with multi-line SQL
-    const rows = await this.db.queryAsync(`SELECT full_content, content_hash FROM content_cache WHERE item_key = ?`, [itemKey]);
+    const rows = await this.db.queryAsync(`SELECT full_content, content_hash FROM content_cache WHERE library_id = ? AND item_key = ?`, [libraryID, itemKey]);
 
     if (!rows || rows.length === 0) return null;
 
@@ -931,28 +1185,29 @@ export class VectorStore {
   /**
    * Set cached content for an item
    */
-  async setCachedContent(itemKey: string, content: string, contentHash: string): Promise<void> {
+  async setCachedContent(libraryID: number, itemKey: string, content: string, contentHash: string): Promise<void> {
     await this.ensureInitialized();
 
     await this.db.queryAsync(`
-      INSERT OR REPLACE INTO content_cache (item_key, full_content, content_hash, cached_at)
-      VALUES (?, ?, ?, strftime('%s', 'now'))
-    `, [itemKey, content, contentHash]);
+      INSERT OR REPLACE INTO content_cache (library_id, item_key, full_content, content_hash, cached_at)
+      VALUES (?, ?, ?, ?, strftime('%s', 'now'))
+    `, [libraryID, itemKey, content, contentHash]);
   }
 
   /**
    * Delete cached content for an item
    */
-  async deleteCachedContent(itemKey: string): Promise<void> {
+  async deleteCachedContent(libraryID: number, itemKey: string): Promise<void> {
     await this.ensureInitialized();
 
-    await this.db.queryAsync(`DELETE FROM content_cache WHERE item_key = ?`, [itemKey]);
+    await this.db.queryAsync(`DELETE FROM content_cache WHERE library_id = ? AND item_key = ?`, [libraryID, itemKey]);
   }
 
   /**
-   * Get all cached content item keys with metadata
+   * Get all cached content items with metadata
    */
   async listCachedContent(): Promise<Array<{
+    libraryID: number;
     itemKey: string;
     contentLength: number;
     hash: string;
@@ -961,11 +1216,12 @@ export class VectorStore {
     await this.ensureInitialized();
 
     // IMPORTANT: Single-line query to avoid Zotero queryAsync bug with multi-line SQL
-    const rows = await this.db.queryAsync(`SELECT item_key, LENGTH(full_content) as content_length, content_hash, cached_at FROM content_cache ORDER BY cached_at DESC`);
+    const rows = await this.db.queryAsync(`SELECT library_id, item_key, LENGTH(full_content) as content_length, content_hash, cached_at FROM content_cache ORDER BY cached_at DESC`);
 
     if (!rows || rows.length === 0) return [];
 
     return rows.map((row: any) => ({
+      libraryID: row.library_id,
       itemKey: row.item_key,
       contentLength: row.content_length,
       hash: row.content_hash,
@@ -1040,71 +1296,49 @@ export class VectorStore {
   /**
    * Get full cached content for an item (alias for getCachedContent for clarity)
    */
-  async getFullContent(itemKey: string): Promise<string | null> {
-    const cached = await this.getCachedContent(itemKey);
+  async getFullContent(libraryID: number, itemKey: string): Promise<string | null> {
+    const cached = await this.getCachedContent(libraryID, itemKey);
     return cached ? cached.content : null;
   }
 
   /**
-   * Get full cached content for multiple items
-   */
-  async getFullContentBatch(itemKeys: string[]): Promise<Map<string, string>> {
-    await this.ensureInitialized();
-
-    const result = new Map<string, string>();
-    if (itemKeys.length === 0) return result;
-
-    const placeholders = itemKeys.map(() => '?').join(',');
-    // IMPORTANT: Single-line query to avoid Zotero queryAsync bug with multi-line SQL
-    const rows = await this.db.queryAsync(`SELECT item_key, full_content FROM content_cache WHERE item_key IN (${placeholders})`, itemKeys);
-
-    if (!rows || rows.length === 0) return result;
-
-    for (const row of rows) {
-      result.set(row.item_key, row.full_content);
-    }
-
-    return result;
-  }
-
-  /**
-   * Delete vectors for an item
-   * @param itemKey The item key to delete
+   * Delete vectors for an item in a library
    * @param deleteContentCache If true, also delete content cache (use when item is permanently deleted)
    */
-  async deleteItemVectors(itemKey: string, deleteContentCache: boolean = false): Promise<void> {
+  async deleteItemVectors(libraryID: number, itemKey: string, deleteContentCache: boolean = false): Promise<void> {
     await this.ensureInitialized();
 
     await this.db.executeTransaction(async () => {
       await this.db.queryAsync(
-        `DELETE FROM embeddings WHERE item_key = ?`,
-        [itemKey]
+        `DELETE FROM embeddings WHERE library_id = ? AND item_key = ?`,
+        [libraryID, itemKey]
       );
       await this.db.queryAsync(
-        `DELETE FROM vectors_f32 WHERE item_key = ?`,
-        [itemKey]
+        `DELETE FROM vectors_f32 WHERE library_id = ? AND item_key = ?`,
+        [libraryID, itemKey]
       );
       await this.db.queryAsync(
-        `DELETE FROM index_status WHERE item_key = ?`,
-        [itemKey]
+        `DELETE FROM index_status WHERE library_id = ? AND item_key = ?`,
+        [libraryID, itemKey]
       );
       if (deleteContentCache) {
         await this.db.queryAsync(
-          `DELETE FROM content_cache WHERE item_key = ?`,
-          [itemKey]
+          `DELETE FROM content_cache WHERE library_id = ? AND item_key = ?`,
+          [libraryID, itemKey]
         );
       }
     });
 
     // Clear cache entries
+    const prefix = `${libraryID}:${itemKey}_`;
     for (const key of this.vectorCache.keys()) {
-      if (key.startsWith(`${itemKey}_`)) {
+      if (key.startsWith(prefix) || key.startsWith(`${itemKey}_`)) {
         this.vectorCache.delete(key);
       }
     }
 
     const cacheMsg = deleteContentCache ? 'including content cache' : 'content cache preserved';
-    ztoolkit.log(`[VectorStore] Deleted vectors for item: ${itemKey} (${cacheMsg})`);
+    ztoolkit.log(`[VectorStore] Deleted vectors for item: ${libraryID}:${itemKey} (${cacheMsg})`);
   }
 
   /**
@@ -1208,7 +1442,7 @@ export class VectorStore {
       `SELECT COUNT(*) FROM embeddings`
     );
     const items = await this.db.valueQueryAsync(
-      `SELECT COUNT(DISTINCT item_key) FROM embeddings`
+      `SELECT COUNT(*) FROM (SELECT DISTINCT library_id, item_key FROM embeddings)`
     );
     const zh = await this.db.valueQueryAsync(
       `SELECT COUNT(*) FROM embeddings WHERE language = 'zh'`
@@ -1291,7 +1525,7 @@ export class VectorStore {
    * Get vectors for a specific item (for find_similar).
    * Reads float32 vectors from vectors_f32 table.
    */
-  async getItemVectors(itemKey: string): Promise<Array<{
+  async getItemVectors(libraryID: number, itemKey: string): Promise<Array<{
     chunkId: number;
     vector: Float32Array;
     language: string;
@@ -1299,14 +1533,14 @@ export class VectorStore {
     await this.ensureInitialized();
 
     // Get dimensions and language from embeddings table
-    const metaRows = await this.db.queryAsync(`SELECT chunk_id, language, dimensions FROM embeddings WHERE item_key = ? ORDER BY chunk_id`, [itemKey]);
+    const metaRows = await this.db.queryAsync(`SELECT chunk_id, language, dimensions FROM embeddings WHERE library_id = ? AND item_key = ? ORDER BY chunk_id`, [libraryID, itemKey]);
 
     if (!metaRows || metaRows.length === 0) {
       return [];
     }
 
     // Get float32 vectors from vectors_f32 table
-    const vecRows = await this.db.queryAsync(`SELECT chunk_id, vector FROM vectors_f32 WHERE item_key = ? ORDER BY chunk_id`, [itemKey]);
+    const vecRows = await this.db.queryAsync(`SELECT chunk_id, vector FROM vectors_f32 WHERE library_id = ? AND item_key = ? ORDER BY chunk_id`, [libraryID, itemKey]);
 
     // Build a map of chunk_id -> vector blob for fast lookup
     const vecMap = new Map<number, any>();
@@ -1829,7 +2063,7 @@ export class VectorStore {
       for (const row of rows) {
         try {
           // Read float32 vector from vectors_f32 table
-          const f32Row = await this.db.queryAsync(`SELECT vector FROM vectors_f32 WHERE item_key = ? AND chunk_id = ?`, [row.item_key, row.chunk_id]);
+          const f32Row = await this.db.queryAsync(`SELECT vector FROM vectors_f32 WHERE library_id = ? AND item_key = ? AND chunk_id = ?`, [row.library_id, row.item_key, row.chunk_id]);
 
           if (!f32Row || f32Row.length === 0) {
             ztoolkit.log(`[VectorStore] No float32 vector found for item_key=${row.item_key}, chunk_id=${row.chunk_id}, skipping`, 'warn');
@@ -1889,7 +2123,7 @@ export class VectorStore {
         const storedInt8 = this.bufferToInt8Array(vRow.vector_int8, vRow.dimensions);
 
         // Load original float32 from vectors_f32 for comparison
-        const origF32Row = await this.db.queryAsync(`SELECT vector FROM vectors_f32 WHERE item_key = ? AND chunk_id = ?`, [vRow.item_key, vRow.chunk_id]);
+        const origF32Row = await this.db.queryAsync(`SELECT vector FROM vectors_f32 WHERE library_id = ? AND item_key = ? AND chunk_id = ?`, [vRow.library_id, vRow.item_key, vRow.chunk_id]);
         if (origF32Row && origF32Row.length > 0) {
           const originalVector = this.bufferToFloat32Array(origF32Row[0].vector, vRow.dimensions);
           const reQuantized = this.quantizeWithNorm(originalVector);

@@ -18,7 +18,7 @@ let itemNotifierID: string | null = null;
 let autoUpdateDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 const AUTO_UPDATE_DEBOUNCE_MS = 5000; // Wait 5 seconds after last change before updating
 
-// Queue of item keys to update
+// Queue of item identity keys (`libraryID:itemKey`) to update
 const pendingAutoUpdateKeys = new Set<string>();
 
 // Flag to prevent recursive auto-update during indexing
@@ -111,10 +111,11 @@ async function processPendingAutoUpdates() {
 }
 
 /**
- * Schedule auto-update with debouncing
+ * Schedule auto-update with debouncing.
+ * @param identityKey `libraryID:itemKey`
  */
-function scheduleAutoUpdate(itemKey: string) {
-  pendingAutoUpdateKeys.add(itemKey);
+function scheduleAutoUpdate(identityKey: string) {
+  pendingAutoUpdateKeys.add(identityKey);
 
   // Clear existing timer
   if (autoUpdateDebounceTimer) {
@@ -136,29 +137,31 @@ async function handleItemsDeleted(itemIds: number[], extraData: any) {
     const { getVectorStore } = await import("./modules/semantic/vectorStore");
     const vectorStore = getVectorStore();
 
-    // Try to get item keys from extraData (Zotero passes old data for deleted items)
-    const itemKeys: string[] = [];
+    // Try to get libraryID + key from extraData (Zotero passes old data for deleted items)
+    const refs: Array<{ libraryID: number; itemKey: string }> = [];
     if (extraData) {
       for (const id of itemIds) {
         const oldData = extraData[id];
         if (oldData?.key) {
-          itemKeys.push(oldData.key);
+          const libraryID =
+            oldData.libraryID ?? Zotero.Libraries.userLibraryID;
+          refs.push({ libraryID, itemKey: oldData.key });
         }
       }
     }
 
-    if (itemKeys.length === 0) {
+    if (refs.length === 0) {
       ztoolkit.log(`[MCP Plugin] No item keys found for deleted items, skipping index cleanup`);
       return;
     }
 
-    ztoolkit.log(`[MCP Plugin] Cleaning up indexes for ${itemKeys.length} deleted items`);
+    ztoolkit.log(`[MCP Plugin] Cleaning up indexes for ${refs.length} deleted items`);
 
-    for (const itemKey of itemKeys) {
+    for (const ref of refs) {
       try {
         // Delete vectors and content cache (item is permanently deleted)
-        await vectorStore.deleteItemVectors(itemKey, true);
-        ztoolkit.log(`[MCP Plugin] Deleted index and cache for item: ${itemKey}`);
+        await vectorStore.deleteItemVectors(ref.libraryID, ref.itemKey, true);
+        ztoolkit.log(`[MCP Plugin] Deleted index and cache for item: ${ref.libraryID}:${ref.itemKey}`);
       } catch (e) {
         // Ignore errors for items that weren't indexed
       }
@@ -209,7 +212,8 @@ function registerItemNotifier() {
         for (const item of items) {
           // Only index regular items (not attachments, notes, etc.)
           if (item.isRegularItem?.()) {
-            scheduleAutoUpdate(item.key);
+            const libraryID = item.libraryID ?? Zotero.Libraries.userLibraryID;
+            scheduleAutoUpdate(`${libraryID}:${item.key}`);
           }
         }
       } else if (event === 'delete') {
@@ -1065,13 +1069,10 @@ async function handleClearCollectionIndex(win: _ZoteroTypes.MainWindow) {
       return;
     }
 
-    // Convert IDs to item objects and get keys
-    const items = Zotero.Items.get(itemIDs);
-    const itemKeys = items
-      .filter((item: any) => item.isRegularItem?.())
-      .map((item: any) => item.key);
+    // Convert IDs to item objects
+    const items = Zotero.Items.get(itemIDs).filter((item: any) => item.isRegularItem?.());
 
-    if (itemKeys.length === 0) {
+    if (items.length === 0) {
       ztoolkit.log("[MCP Plugin] No regular items in collection");
       return;
     }
@@ -1082,9 +1083,10 @@ async function handleClearCollectionIndex(win: _ZoteroTypes.MainWindow) {
     await vectorStore.initialize();
 
     let clearedCount = 0;
-    for (const itemKey of itemKeys) {
+    for (const item of items) {
       try {
-        await vectorStore.deleteItemVectors(itemKey);
+        const libraryID = item.libraryID ?? Zotero.Libraries.userLibraryID;
+        await vectorStore.deleteItemVectors(libraryID, item.key);
         clearedCount++;
       } catch (e) {
         // Ignore errors for items that weren't indexed
@@ -1123,24 +1125,22 @@ async function handleClearSelectedIndex(win: _ZoteroTypes.MainWindow) {
       return;
     }
 
-    // Get item keys
-    const itemKeys = selectedItems
-      .filter((item: any) => item.isRegularItem?.())
-      .map((item: any) => item.key);
+    // Get regular items
+    const regularItems = selectedItems.filter((item: any) => item.isRegularItem?.());
 
-    if (itemKeys.length === 0) {
+    if (regularItems.length === 0) {
       ztoolkit.log("[MCP Plugin] No regular items selected");
       return;
     }
 
     // Confirm before clearing
     const confirmMsg = getString("menu-semantic-clear-selected-confirm" as any) ||
-      `Are you sure you want to clear the semantic index for ${itemKeys.length} selected item(s)?`;
+      `Are you sure you want to clear the semantic index for ${regularItems.length} selected item(s)?`;
     if (!win.confirm(confirmMsg)) {
       return;
     }
 
-    ztoolkit.log(`[MCP Plugin] Clearing index for ${itemKeys.length} selected items...`);
+    ztoolkit.log(`[MCP Plugin] Clearing index for ${regularItems.length} selected items...`);
 
     // Delete vectors for these items
     const { getVectorStore } = await import("./modules/semantic/vectorStore");
@@ -1148,9 +1148,10 @@ async function handleClearSelectedIndex(win: _ZoteroTypes.MainWindow) {
     await vectorStore.initialize();
 
     let clearedCount = 0;
-    for (const itemKey of itemKeys) {
+    for (const item of regularItems) {
       try {
-        await vectorStore.deleteItemVectors(itemKey);
+        const libraryID = item.libraryID ?? Zotero.Libraries.userLibraryID;
+        await vectorStore.deleteItemVectors(libraryID, item.key);
         clearedCount++;
       } catch (e) {
         // Ignore errors for items that weren't indexed
