@@ -19,6 +19,7 @@ import {
   filterIndexableLibraries,
   resolveFindSimilarSource,
 } from './libraryScope';
+import { planSemanticIndex, type SemanticIndexPlan } from './indexPlan';
 
 declare let Zotero: any;
 declare let ztoolkit: ZToolkit;
@@ -399,16 +400,77 @@ export class SemanticSearchService {
   // ============ Indexing Methods ============
 
   /**
+   * Dry-run: count items that would be indexed across libraries (no embeddings).
+   */
+  async planIndex(options: { itemKeys?: string[] } = {}): Promise<SemanticIndexPlan> {
+    await this.initialize();
+
+    const excludeLibraryIDs = this.getExcludeLibraryIDs();
+    const allLibs = (Zotero.Libraries.getAll() || []).map((lib: any) => ({
+      libraryID: lib.libraryID,
+      libraryType: lib.libraryType,
+      name: lib.name,
+    }));
+
+    let items: any[];
+    if (options.itemKeys && options.itemKeys.length > 0) {
+      items = await this.getItemsByKeys(options.itemKeys);
+    } else {
+      items = await this.getItemsWithContent();
+    }
+
+    const itemRefs = items.map((item: any) => ({
+      libraryID: item.libraryID ?? Zotero.Libraries.userLibraryID,
+      itemKey: item.key as string,
+    }));
+
+    const indexedIdentityKeys = await this.vectorStore.getIndexedItems();
+    const plan = planSemanticIndex({
+      libraries: allLibs,
+      items: itemRefs,
+      excludeLibraryIDs,
+      indexedIdentityKeys,
+    });
+
+    ztoolkit.log(
+      `[SemanticSearch] planIndex: toIndex=${plan.totalItems}, alreadyIndexed=${plan.alreadyIndexed}, libraries=${plan.librariesInScope.map((l) => l.libraryID).join(',')}`,
+    );
+    return plan;
+  }
+
+  /**
    * Build or update the semantic index
    */
   async buildIndex(options: {
     itemKeys?: string[];
     rebuild?: boolean;
+    /** If true, compute plan only — no embeddings, no writes */
+    dryRun?: boolean;
     onProgress?: (progress: IndexProgress) => void;
   } = {}): Promise<IndexProgress> {
     await this.initialize();
 
-    const { itemKeys, rebuild = false, onProgress } = options;
+    const { itemKeys, rebuild = false, dryRun = false, onProgress } = options;
+
+    if (dryRun) {
+      const plan = await this.planIndex({ itemKeys });
+      const summary = plan.librariesInScope
+        .map((l) => {
+          const row = plan.byLibrary[l.libraryID];
+          return `${l.name || l.libraryID}: +${row?.toIndex ?? 0}/${row?.totalCandidates ?? 0}`;
+        })
+        .join('; ');
+      this.indexProgress = {
+        total: plan.totalItems,
+        processed: 0,
+        status: 'completed',
+        currentItem: `dry-run: ${summary}`,
+        startTime: Date.now(),
+      };
+      ztoolkit.log(`[SemanticSearch] dryRun complete: ${summary}`);
+      onProgress?.(this.indexProgress);
+      return this.indexProgress;
+    }
 
     if (this._buildActive) {
       ztoolkit.log('[SemanticSearch] buildIndex already running, ignoring duplicate call', 'warn');

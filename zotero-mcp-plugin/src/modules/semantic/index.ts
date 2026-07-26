@@ -23,6 +23,18 @@ export {
   resolveFindSimilarSource,
 } from './libraryScope';
 
+export {
+  planSemanticIndex,
+  type SemanticIndexPlan,
+  type IndexableItemRef,
+} from './indexPlan';
+
+export {
+  migrateSemanticDbToMultiLibrary,
+  hasMultiLibrarySchema,
+  type MigrateResult,
+} from './migrateMultiLibrary';
+
 // Embedding service
 export {
   EmbeddingService,

@@ -30,7 +30,8 @@
     "prepare-release": "node scripts/prepare-release.js",
     "release:init": "node scripts/init-release.js",
     "test": "zotero-plugin test",
-    "test:unit": "node --experimental-strip-types --test src/modules/semantic/libraryScope.test.ts",
+    "test:unit": "tsx --test src/modules/semantic/*.test.ts",
+    "test:migrate-copy": "tsx scripts/migrate-vectors-copy.ts",
     "test:update": "node scripts/test-update.js",
     "update-deps": "npm update --save"
   },
@@ -46,6 +47,7 @@
     "eslint": "^9.32.0",
     "mocha": "^11.7.1",
     "prettier": "^3.6.2",
+    "tsx": "^4.23.1",
     "typescript": "^5.9.2",
     "zotero-plugin-scaffold": "^0.8.6",
     "zotero-types": "^4.1.2"

@@ -873,6 +873,22 @@ export class StreamableMCPServer {
           properties: {}
         }
       },
+      {
+        name: 'semantic_index_plan',
+        description:
+          'Dry-run multi-library index plan: which libraries and how many items would be embedded. No embeddings, no writes. Use before a full index to estimate cost.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            itemKeys: {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'Optional subset as libraryID:itemKey or bare itemKey (personal library). Omit to plan the full multi-library set.',
+            },
+          },
+        },
+      },
       // Full-text Database Tool (read-only operations)
       {
         name: 'fulltext_database',
@@ -1083,7 +1099,12 @@ export class StreamableMCPServer {
 
     // Filter out semantic tools if semantic search is disabled
     const semanticEnabled = Zotero.Prefs.get('extensions.zotero.zotero-mcp-plugin.semantic.enabled', true);
-    const semanticToolNames = new Set(['semantic_search', 'find_similar', 'semantic_status']);
+    const semanticToolNames = new Set([
+      'semantic_search',
+      'find_similar',
+      'semantic_status',
+      'semantic_index_plan',
+    ]);
     const filteredTools = semanticEnabled === false
       ? tools.filter((t: any) => !semanticToolNames.has(t.name))
       : tools;
@@ -1265,7 +1286,8 @@ export class StreamableMCPServer {
         // Semantic Search Tools
         case 'semantic_search':
         case 'find_similar':
-        case 'semantic_status': {
+        case 'semantic_status':
+        case 'semantic_index_plan': {
           const semEnabled = Zotero.Prefs.get('extensions.zotero.zotero-mcp-plugin.semantic.enabled', true);
           if (semEnabled === false) {
             throw new Error('Semantic search is disabled. Enable it in Zotero MCP Plugin preferences.');
@@ -1276,6 +1298,8 @@ export class StreamableMCPServer {
           } else if (name === 'find_similar') {
             if (!args?.itemKey) throw new Error('itemKey is required');
             result = await this.callFindSimilar(args);
+          } else if (name === 'semantic_index_plan') {
+            result = await this.callSemanticIndexPlan(args);
           } else {
             result = await this.callSemanticStatus();
           }
@@ -1780,6 +1804,32 @@ export class StreamableMCPServer {
       return response;
     } catch (error) {
       ztoolkit.log(`[StreamableMCP] Find similar error: ${error}`, 'error');
+      throw error;
+    }
+  }
+
+  private async callSemanticIndexPlan(args: any): Promise<any> {
+    try {
+      const semanticService = getSemanticSearchService();
+      await semanticService.initialize();
+      const plan = await semanticService.planIndex({
+        itemKeys: args?.itemKeys,
+      });
+      // Omit full toIndex list if huge — agents need counts, not 10k keys
+      const { toIndex, ...summary } = plan;
+      return {
+        mode: 'semantic_index_plan',
+        dryRun: true,
+        ...summary,
+        sampleToIndex: toIndex.slice(0, 20),
+        toIndexCount: toIndex.length,
+        metadata: {
+          extractedAt: new Date().toISOString(),
+          note: 'No embeddings were generated. Use Auto Update or Rebuild only after reviewing counts.',
+        },
+      };
+    } catch (error) {
+      ztoolkit.log(`[StreamableMCP] semantic_index_plan error: ${error}`, 'error');
       throw error;
     }
   }

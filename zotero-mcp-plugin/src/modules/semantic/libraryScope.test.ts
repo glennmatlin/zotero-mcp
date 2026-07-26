@@ -12,7 +12,7 @@ import {
   isIndexableLibrary,
   filterIndexableLibraries,
   resolveFindSimilarSource,
-} from './libraryScope.ts';
+} from './libraryScope';
 
 describe('itemIdentityKey', () => {
   it('round-trips libraryID and itemKey', () => {

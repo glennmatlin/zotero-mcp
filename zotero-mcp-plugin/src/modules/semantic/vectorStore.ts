@@ -5,6 +5,11 @@
  * Stores embeddings as BLOBs and performs similarity search in memory.
  */
 
+import {
+  migrateSemanticDbToMultiLibrary,
+  type AsyncSqlDb,
+} from './migrateMultiLibrary';
+
 declare let Zotero: any;
 declare let ztoolkit: ZToolkit;
 declare let PathUtils: any;
@@ -248,298 +253,47 @@ export class VectorStore {
     }
   }
 
-  private async tableExists(table: string): Promise<boolean> {
-    const rows = await this.db.queryAsync(
-      `SELECT name FROM sqlite_master WHERE type='table' AND name=?`,
-      [table],
-    );
-    return !!(rows && rows.length > 0);
-  }
-
-  private async hasColumn(table: string, column: string): Promise<boolean> {
-    const rows = await this.db.queryAsync(`PRAGMA table_info(${table})`);
-    return (rows || []).some((r: any) => r.name === column);
+  /** Adapt Zotero DBConnection to pure AsyncSqlDb for shared migrate logic. */
+  private zoteroSqlDb(): AsyncSqlDb {
+    return {
+      exec: async (sql: string) => {
+        await this.db.queryAsync(sql);
+      },
+      run: async (sql: string, params: unknown[] = []) => {
+        await this.db.queryAsync(sql, params);
+      },
+      all: async (sql: string, params: unknown[] = []) => {
+        const rows = await this.db.queryAsync(sql, params);
+        return (rows || []) as Record<string, unknown>[];
+      },
+      get: async (sql: string, params: unknown[] = []) => {
+        const rows = await this.db.queryAsync(sql, params);
+        return rows && rows.length > 0
+          ? (rows[0] as Record<string, unknown>)
+          : undefined;
+      },
+    };
   }
 
   /**
    * Ensure multi-library schema (library_id + item_key identity).
    * Soft-migrates older personal-only DBs by stamping userLibraryID.
+   * Migration SQL lives in migrateMultiLibrary.ts (unit-tested offline).
    */
   private async ensureMultiLibrarySchema(): Promise<void> {
     const userLibraryID: number = Zotero.Libraries.userLibraryID;
-    const embeddingsExists = await this.tableExists('embeddings');
-
-    if (!embeddingsExists) {
-      await this.createMultiLibraryTablesFresh();
-      return;
-    }
-
-    if (!(await this.hasColumn('embeddings', 'library_id'))) {
+    const result = await migrateSemanticDbToMultiLibrary(
+      this.zoteroSqlDb(),
+      userLibraryID,
+    );
+    if (result.migrated) {
       ztoolkit.log(
-        `[VectorStore] Migrating semantic index to multi-library (stamp library_id=${userLibraryID})...`,
+        `[VectorStore] Multi-library schema migration complete (library_id=${userLibraryID})`,
       );
-      await this.migrateTablesToMultiLibrary(userLibraryID);
-      ztoolkit.log('[VectorStore] Multi-library schema migration complete');
-      return;
+    } else if (result.createdFresh) {
+      ztoolkit.log('[VectorStore] Created fresh multi-library semantic tables');
     }
-
-    // Already multi-library: keep optional columns / indexes in sync
     await this.ensureOptionalEmbeddingColumns();
-  }
-
-  private async createMultiLibraryTablesFresh(): Promise<void> {
-    await this.db.queryAsync(`
-      CREATE TABLE IF NOT EXISTS embeddings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        library_id INTEGER NOT NULL,
-        item_key TEXT NOT NULL,
-        chunk_id INTEGER NOT NULL,
-        vector BLOB NOT NULL,
-        language TEXT NOT NULL CHECK(language IN ('zh', 'en')),
-        chunk_text TEXT,
-        dimensions INTEGER NOT NULL,
-        created_at INTEGER DEFAULT (strftime('%s', 'now')),
-        vector_int8 BLOB,
-        vector_scale REAL,
-        vector_norm REAL,
-        UNIQUE(library_id, item_key, chunk_id)
-      )
-    `);
-
-    await this.db.queryAsync(`
-      CREATE INDEX IF NOT EXISTS idx_embeddings_item
-      ON embeddings(library_id, item_key)
-    `);
-
-    await this.db.queryAsync(`
-      CREATE INDEX IF NOT EXISTS idx_embeddings_language
-      ON embeddings(language)
-    `);
-
-    await this.db.queryAsync(`
-      CREATE TABLE IF NOT EXISTS index_status (
-        library_id INTEGER NOT NULL,
-        item_key TEXT NOT NULL,
-        indexed_at INTEGER NOT NULL,
-        version INTEGER DEFAULT 1,
-        chunk_count INTEGER NOT NULL,
-        content_hash TEXT NOT NULL,
-        item_modified TEXT,
-        attachment_modified TEXT,
-        PRIMARY KEY (library_id, item_key)
-      )
-    `);
-
-    await this.db.queryAsync(`
-      CREATE TABLE IF NOT EXISTS content_cache (
-        library_id INTEGER NOT NULL,
-        item_key TEXT NOT NULL,
-        full_content TEXT NOT NULL,
-        content_hash TEXT NOT NULL,
-        cached_at INTEGER DEFAULT (strftime('%s', 'now')),
-        PRIMARY KEY (library_id, item_key)
-      )
-    `);
-
-    await this.db.queryAsync(`
-      CREATE TABLE IF NOT EXISTS vectors_f32 (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        library_id INTEGER NOT NULL,
-        item_key TEXT NOT NULL,
-        chunk_id INTEGER NOT NULL,
-        vector BLOB NOT NULL,
-        UNIQUE(library_id, item_key, chunk_id)
-      )
-    `);
-
-    await this.db.queryAsync(`
-      CREATE INDEX IF NOT EXISTS idx_vectors_f32_item
-      ON vectors_f32(library_id, item_key)
-    `);
-  }
-
-  private async migrateTablesToMultiLibrary(userLibraryID: number): Promise<void> {
-    // --- embeddings ---
-    await this.db.queryAsync(`
-      CREATE TABLE embeddings_ml (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        library_id INTEGER NOT NULL,
-        item_key TEXT NOT NULL,
-        chunk_id INTEGER NOT NULL,
-        vector BLOB NOT NULL,
-        language TEXT NOT NULL CHECK(language IN ('zh', 'en')),
-        chunk_text TEXT,
-        dimensions INTEGER NOT NULL,
-        created_at INTEGER DEFAULT (strftime('%s', 'now')),
-        vector_int8 BLOB,
-        vector_scale REAL,
-        vector_norm REAL,
-        UNIQUE(library_id, item_key, chunk_id)
-      )
-    `);
-
-    const embCols = await this.db.queryAsync(`PRAGMA table_info(embeddings)`);
-    const embNames = new Set((embCols || []).map((c: any) => c.name));
-    const hasInt8 = embNames.has('vector_int8');
-
-    if (hasInt8) {
-      await this.db.queryAsync(
-        `INSERT INTO embeddings_ml (
-          library_id, item_key, chunk_id, vector, language, chunk_text, dimensions,
-          created_at, vector_int8, vector_scale, vector_norm
-        )
-        SELECT ?, item_key, chunk_id, vector, language, chunk_text, dimensions,
-          created_at, vector_int8, vector_scale, vector_norm
-        FROM embeddings`,
-        [userLibraryID],
-      );
-    } else {
-      await this.db.queryAsync(
-        `INSERT INTO embeddings_ml (
-          library_id, item_key, chunk_id, vector, language, chunk_text, dimensions, created_at
-        )
-        SELECT ?, item_key, chunk_id, vector, language, chunk_text, dimensions, created_at
-        FROM embeddings`,
-        [userLibraryID],
-      );
-    }
-    await this.db.queryAsync(`DROP TABLE embeddings`);
-    await this.db.queryAsync(`ALTER TABLE embeddings_ml RENAME TO embeddings`);
-    await this.db.queryAsync(
-      `CREATE INDEX IF NOT EXISTS idx_embeddings_item ON embeddings(library_id, item_key)`,
-    );
-    await this.db.queryAsync(
-      `CREATE INDEX IF NOT EXISTS idx_embeddings_language ON embeddings(language)`,
-    );
-
-    // --- index_status ---
-    if (await this.tableExists('index_status')) {
-      await this.db.queryAsync(`
-        CREATE TABLE index_status_ml (
-          library_id INTEGER NOT NULL,
-          item_key TEXT NOT NULL,
-          indexed_at INTEGER NOT NULL,
-          version INTEGER DEFAULT 1,
-          chunk_count INTEGER NOT NULL,
-          content_hash TEXT NOT NULL,
-          item_modified TEXT,
-          attachment_modified TEXT,
-          PRIMARY KEY (library_id, item_key)
-        )
-      `);
-      const isCols = await this.db.queryAsync(`PRAGMA table_info(index_status)`);
-      const isNames = new Set((isCols || []).map((c: any) => c.name));
-      const hasItemMod = isNames.has('item_modified');
-      if (hasItemMod) {
-        await this.db.queryAsync(
-          `INSERT OR IGNORE INTO index_status_ml (
-            library_id, item_key, indexed_at, version, chunk_count, content_hash,
-            item_modified, attachment_modified
-          )
-          SELECT ?, item_key, indexed_at, version, chunk_count, content_hash,
-            item_modified, attachment_modified
-          FROM index_status`,
-          [userLibraryID],
-        );
-      } else {
-        await this.db.queryAsync(
-          `INSERT OR IGNORE INTO index_status_ml (
-            library_id, item_key, indexed_at, version, chunk_count, content_hash
-          )
-          SELECT ?, item_key, indexed_at, version, chunk_count, content_hash
-          FROM index_status`,
-          [userLibraryID],
-        );
-      }
-      await this.db.queryAsync(`DROP TABLE index_status`);
-      await this.db.queryAsync(`ALTER TABLE index_status_ml RENAME TO index_status`);
-    } else {
-      await this.db.queryAsync(`
-        CREATE TABLE index_status (
-          library_id INTEGER NOT NULL,
-          item_key TEXT NOT NULL,
-          indexed_at INTEGER NOT NULL,
-          version INTEGER DEFAULT 1,
-          chunk_count INTEGER NOT NULL,
-          content_hash TEXT NOT NULL,
-          item_modified TEXT,
-          attachment_modified TEXT,
-          PRIMARY KEY (library_id, item_key)
-        )
-      `);
-    }
-
-    // --- content_cache ---
-    if (await this.tableExists('content_cache')) {
-      await this.db.queryAsync(`
-        CREATE TABLE content_cache_ml (
-          library_id INTEGER NOT NULL,
-          item_key TEXT NOT NULL,
-          full_content TEXT NOT NULL,
-          content_hash TEXT NOT NULL,
-          cached_at INTEGER DEFAULT (strftime('%s', 'now')),
-          PRIMARY KEY (library_id, item_key)
-        )
-      `);
-      await this.db.queryAsync(
-        `INSERT OR IGNORE INTO content_cache_ml (
-          library_id, item_key, full_content, content_hash, cached_at
-        )
-        SELECT ?, item_key, full_content, content_hash, cached_at FROM content_cache`,
-        [userLibraryID],
-      );
-      await this.db.queryAsync(`DROP TABLE content_cache`);
-      await this.db.queryAsync(`ALTER TABLE content_cache_ml RENAME TO content_cache`);
-    } else {
-      await this.db.queryAsync(`
-        CREATE TABLE content_cache (
-          library_id INTEGER NOT NULL,
-          item_key TEXT NOT NULL,
-          full_content TEXT NOT NULL,
-          content_hash TEXT NOT NULL,
-          cached_at INTEGER DEFAULT (strftime('%s', 'now')),
-          PRIMARY KEY (library_id, item_key)
-        )
-      `);
-    }
-
-    // --- vectors_f32 ---
-    if (await this.tableExists('vectors_f32')) {
-      await this.db.queryAsync(`
-        CREATE TABLE vectors_f32_ml (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          library_id INTEGER NOT NULL,
-          item_key TEXT NOT NULL,
-          chunk_id INTEGER NOT NULL,
-          vector BLOB NOT NULL,
-          UNIQUE(library_id, item_key, chunk_id)
-        )
-      `);
-      await this.db.queryAsync(
-        `INSERT OR IGNORE INTO vectors_f32_ml (library_id, item_key, chunk_id, vector)
-         SELECT ?, item_key, chunk_id, vector FROM vectors_f32`,
-        [userLibraryID],
-      );
-      await this.db.queryAsync(`DROP TABLE vectors_f32`);
-      await this.db.queryAsync(`ALTER TABLE vectors_f32_ml RENAME TO vectors_f32`);
-      await this.db.queryAsync(
-        `CREATE INDEX IF NOT EXISTS idx_vectors_f32_item ON vectors_f32(library_id, item_key)`,
-      );
-    } else {
-      await this.db.queryAsync(`
-        CREATE TABLE vectors_f32 (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          library_id INTEGER NOT NULL,
-          item_key TEXT NOT NULL,
-          chunk_id INTEGER NOT NULL,
-          vector BLOB NOT NULL,
-          UNIQUE(library_id, item_key, chunk_id)
-        )
-      `);
-      await this.db.queryAsync(
-        `CREATE INDEX IF NOT EXISTS idx_vectors_f32_item ON vectors_f32(library_id, item_key)`,
-      );
-    }
   }
 
   private async ensureOptionalEmbeddingColumns(): Promise<void> {
